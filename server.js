@@ -3,55 +3,116 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const { put } = require('@vercel/blob');
-const { customAlphabet } = require('nanoid');
 const QRCode = require('qrcode');
 const Store = require('./store');
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
-const nanoid = customAlphabet('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ', 6);
+// Custom ID generator to avoid ESM issues with nanoid
+function generateId(length = 6) {
+    const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    let result = '';
+    for (let i = 0; i < length; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
+}
+
+// Log capture for debugging
+const serverLogs = [];
+function log(type, msg, error = '') {
+    const entry = `[${new Date().toISOString()}] ${type}: ${msg} ${error}`;
+    console.log(entry);
+    serverLogs.push(entry);
+    if (serverLogs.length > 50) serverLogs.shift();
+}
 
 app.use(cors());
 app.use(express.static('public'));
 app.use(express.json());
 
+app.get('/api/logs', (req, res) => res.json(serverLogs));
+
 // Upload Route
 app.post('/api/upload', upload.single('file'), async (req, res) => {
-    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    log('INFO', 'Upload request received');
+    if (!req.file) {
+        log('ERROR', 'No file in request');
+        return res.status(400).json({ error: 'No file provided' });
+    }
+    
+    // Check if token is obviously invalid
+    const token = process.env.BLOB_READ_WRITE_TOKEN;
+    const isTokenInvalid = !token || token.includes('****');
+
+    let blobUrl;
     
     try {
+        log('INFO', 'Attempting upload...');
+        if (isTokenInvalid) {
+            log('WARN', 'Invalid token detected, forcing mock mode.');
+            throw new Error('Invalid Token (Mock Mode Trigger)');
+        }
+
         // 1. Upload to Vercel Blob
-        // Note: BLOB_READ_WRITE_TOKEN must be set in .env
         const blob = await put(req.file.originalname, req.file.buffer, { 
             access: 'public',
         });
+        blobUrl = blob.url;
+        log('INFO', 'Vercel Blob upload successful:', blobUrl);
 
-        // 2. Generate Metadata
-        const hex = nanoid();
-        const uploadData = {
-            hex,
-            url: blob.url,
-            filename: req.file.originalname,
-            size: req.file.size,
-            mimetype: req.file.mimetype,
-            timestamp: new Date().toISOString()
-        };
+    } catch (error) {
+        log('WARN', 'Fallback triggered:', error.message);
+        
+        // Fallback: Local Storage
+        if (process.env.VERCEL) {
+            log('ERROR', 'Running on Vercel with invalid token - cannot fallback.');
+            throw new Error('Vercel Blob Token missing or invalid. Cannot use local fallback on Vercel.');
+        }
 
+        try {
+            // Ensure public/uploads exists
+            const fs = require('fs');
+            const path = require('path');
+            const uploadDir = path.join(__dirname, 'public', 'uploads');
+            if (!fs.existsSync(uploadDir)) {
+                fs.mkdirSync(uploadDir, { recursive: true });
+            }
+
+            const fileName = `${generateId()}-${req.file.originalname}`;
+            const filePath = path.join(uploadDir, fileName);
+            fs.writeFileSync(filePath, req.file.buffer);
+            
+            // Construct local URL
+            const protocol = req.protocol;
+            const host = req.get('host');
+            blobUrl = `${protocol}://${host}/uploads/${fileName}`;
+            log('INFO', 'Local fallback successful:', blobUrl);
+        } catch (fsError) {
+            log('ERROR', 'Local filesystem write failed:', fsError.message);
+            throw fsError;
+        }
+    }
+
+    try {
+        // ... rest of logic
         // 3. Store
-        Store.add(uploadData);
+        log('INFO', 'Storing metadata...');
+        Store.add({ ...req.body, url: blobUrl }); // Mocking data for log
 
         // 4. Generate QR
-        const qrDataURL = await QRCode.toDataURL(blob.url);
+        log('INFO', 'Generating QR...');
+        const qrDataURL = await QRCode.toDataURL(blobUrl);
 
         res.json({
             success: true,
             hex,
-            url: blob.url,
+            url: blobUrl,
             qr: qrDataURL
         });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Upload failed' });
+        log('ERROR', 'Error generating response:', error.message);
+        res.status(500).json({ error: 'Processing failed: ' + error.message });
     }
 });
 
